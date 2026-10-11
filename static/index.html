@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EdYoda AI Call Agent</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7fb; --panel: #ffffff; --text: #14161f; --muted: #5d6478; --line: #dfe2ec;
+    --accent: #5b5bf0; --talk: #e5484d; --think: #d99100; --speak: #1f9d55;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e1016; --panel: #171a23; --text: #f1f3f9; --muted: #9aa3b8; --line: #2a2f3d;
+            --accent: #8b8bff; --talk: #ff6369; --think: #f5b83d; --speak: #3dd68c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 18px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 60rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  h1 { font-size: 1.4rem; margin: 0; flex: 1; }
+  .controls { display: flex; align-items: center; gap: .9rem; flex-wrap: wrap; font-size: .9rem; color: var(--muted); }
+  select, .btn { font: inherit; }
+  select { padding: .35rem .5rem; border-radius: .5rem; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+  .btn { padding: .55rem 1.3rem; border-radius: 999px; border: 0; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }
+  .btn.end { background: var(--talk); }
+
+  .stage { display: grid; place-items: center; text-align: center; padding: 2.2rem 0 1.4rem; }
+  #mic {
+    --level: 0;
+    width: 11rem; height: 11rem; border-radius: 50%; border: 0; cursor: pointer; color: #fff;
+    background: var(--accent); font: inherit; font-weight: 700; font-size: 1.05rem;
+    box-shadow: 0 0 0 calc(.4rem + var(--level) * 2.2rem) color-mix(in srgb, var(--ring, var(--accent)) 28%, transparent);
+    transition: background .15s, box-shadow .06s; touch-action: none; user-select: none;
+  }
+  #mic:disabled { background: var(--line); color: var(--muted); cursor: not-allowed; box-shadow: none; }
+  body[data-state="talking"]  { --ring: var(--talk); }
+  body[data-state="talking"]  #mic { background: var(--talk); }
+  body[data-state="thinking"] { --ring: var(--think); }
+  body[data-state="thinking"] #mic { background: var(--think); }
+  body[data-state="speaking"] { --ring: var(--speak); }
+  body[data-state="speaking"] #mic { background: var(--speak); }
+  #state { margin-top: 1.4rem; font-size: 1.6rem; font-weight: 700; }
+  #hint { color: var(--muted); font-size: .95rem; min-height: 1.5em; }
+  #error { color: var(--talk); font-weight: 600; min-height: 1.5em; }
+
+  #log { display: flex; flex-direction: column; gap: .7rem; margin-top: 1rem; }
+  .turn { max-width: 85%; padding: .7rem 1rem; border-radius: 1rem; background: var(--panel); border: 1px solid var(--line); font-size: 1.15rem; }
+  .turn small { display: block; color: var(--muted); font-weight: 600; font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; }
+  .turn.you { align-self: flex-end; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); }
+  .turn.agent { align-self: flex-start; }
+</style>
+
+<main>
+  <header>
+    <h1>EdYoda AI Call Agent</h1>
+    <div class="controls">
+      <label>Mic
+        <select id="mode">
+          <option value="ptt" selected>Push to talk</option>
+          <option value="open">Open mic</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="ambience" /> room tone</label>
+      <button class="btn" id="session">Start session</button>
+    </div>
+  </header>
+
+  <section class="stage">
+    <button id="mic" disabled>Start session first</button>
+    <div id="state">Not connected</div>
+    <div id="hint">Click “Start session”, then hold the button (or the space bar) while you speak.</div>
+    <div id="error"></div>
+  </section>
+
+  <section id="log"></section>
+</main>
+
+<script type="module">
+  import { startAmbience } from "/ambience.js";
+
+  const MIC_RATE = 16000;
+  const FRAME_MS = 40;
+  const RELEASE_GRACE_MS = 350; // keep the gate open past release so the last word is not clipped
+
+  const $ = (id) => document.getElementById(id);
+  const sessionBtn = $("session"), micBtn = $("mic"), modeSel = $("mode");
+  const stateEl = $("state"), hintEl = $("hint"), errorEl = $("error"), logEl = $("log");
+
+  let ws, micCtx, playCtx, playback, stream, stopAmbience = null;
+  let live = false, serverRate = 24000, tail = 0;
+  let held = false, graceTimer = null;     // push-to-talk gate
+  let thinking = false, playEnd = 0;       // playEnd: playCtx.currentTime when buffered audio runs out
+  let currentReply = null, level = 0;
+
+  const isOpenMic = () => modeSel.value === "open";
+  const gateOpen = () => isOpenMic() || held;
+
+  // ---- state display ----------------------------------------------------
+  function speaking() { return playCtx && playEnd > playCtx.currentTime + 0.02; }
+
+  function render() {
+    let s, text, hint = "";
+    if (!live) { s = "idle"; text = "Not connected"; hint = "Click “Start session”, then hold the button (or the space bar) while you speak."; }
+    else if (gateOpen() && held) { s = "talking"; text = "Listening to you…"; hint = "Release when you finish."; }
+    else if (isOpenMic() && !speaking() && !thinking) { s = "talking"; text = "Mic is open — just talk"; }
+    else if (thinking) { s = "thinking"; text = "Thinking…"; }
+    else if (speaking()) { s = "speaking"; text = "Agent is speaking"; hint = isOpenMic() ? "" : "Hold the button to interrupt."; }
+    else { s = "ready"; text = "Ready"; hint = "Hold the button or space bar and speak."; }
+    document.body.dataset.state = s;
+    stateEl.textContent = text;
+    hintEl.textContent = hint;
+    micBtn.disabled = !live;
+    micBtn.textContent = !live ? "Start session first"
+      : isOpenMic() ? "Mic open" : held ? "Release to send" : "Hold to talk";
+  }
+  setInterval(render, 150); // playback end has no event; poll it
+
+  function setError(msg) { errorEl.textContent = msg || ""; }
+
+  function line(role, text) {
+    const el = document.createElement("div");
+    el.className = `turn ${role}`;
+    const who = document.createElement("small");
+    who.textContent = role === "you" ? "You" : "Agent";
+    el.append(who, text);
+    logEl.append(el);
+    el.scrollIntoView({ block: "end", behavior: "smooth" });
+    return el;
+  }
+
+  // ---- push to talk -----------------------------------------------------
+  function press() {
+    if (!live) return;
+    clearTimeout(graceTimer);
+    held = true;
+    render();
+  }
+  function release() {
+    if (!held) return;
+    clearTimeout(graceTimer);
+    graceTimer = setTimeout(() => { held = false; render(); }, RELEASE_GRACE_MS);
+  }
+
+  micBtn.addEventListener("pointerdown", (e) => { micBtn.setPointerCapture(e.pointerId); press(); });
+  micBtn.addEventListener("pointerup", release);
+  micBtn.addEventListener("pointercancel", release);
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "Space" || e.repeat || e.target instanceof HTMLSelectElement) return;
+    e.preventDefault();
+    press();
+  });
+  window.addEventListener("keyup", (e) => { if (e.code === "Space") { e.preventDefault(); release(); } });
+  window.addEventListener("blur", release);
+  modeSel.addEventListener("change", () => { held = false; render(); });
+
+  // ---- session ----------------------------------------------------------
+  sessionBtn.onclick = () => (live ? hangup() : start());
+
+  async function start() {
+    setError("");
+    sessionBtn.disabled = true;
+    try {
+      // Echo cancellation matters most in open-mic mode; push to talk already
+      // keeps the agent from hearing itself.
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+      });
+    } catch (err) {
+      sessionBtn.disabled = false;
+      setError(err.name === "NotAllowedError"
+        ? "Microphone blocked. Allow mic access for this page in the browser address bar, then try again."
+        : `Could not open the microphone: ${err.message}`);
+      return;
+    }
+
+    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/call`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onmessage = async (e) => {
+      if (typeof e.data !== "string") return playPcm(e.data);
+      const msg = JSON.parse(e.data);
+      if (msg.type === "ready") { serverRate = msg.sample_rate; await openPlayback(); }
+      else if (msg.type === "transcript") { line("you", msg.text); thinking = true; currentReply = null; }
+      else if (msg.type === "reply_text") appendReply(msg.text);
+      else if (msg.type === "speech_start") { thinking = true; currentReply = null; }
+      else if (msg.type === "speech_end") { if (!speaking()) thinking = false; }
+      else if (msg.type === "interrupt") { flushPlayback(); thinking = false; }
+      else if (msg.type === "error") { thinking = false; setError(`Agent error — ${msg.message}`); }
+      render();
+    };
+
+    ws.onopen = async () => {
+      try {
+        await openCapture();
+      } catch (err) {
+        setError(`Audio setup failed: ${err.message}`);
+        return hangup();
+      }
+      live = true;
+      sessionBtn.disabled = false;
+      sessionBtn.textContent = "End session";
+      sessionBtn.classList.add("end");
+      render();
+    };
+    ws.onerror = () => setError("Could not reach the call server. Is it running?");
+    ws.onclose = () => hangup();
+  }
+
+  async function openCapture() {
+    micCtx = new AudioContext({ sampleRate: MIC_RATE });
+    await micCtx.audioWorklet.addModule("/capture-worklet.js");
+    const node = new AudioWorkletNode(micCtx, "capture");
+    node.port.onmessage = (e) => {
+      if (ws?.readyState !== 1) return;
+      const frame = new Int16Array(e.data);
+      // Peak level drives the ring around the button so the audience can see
+      // the mic is live.
+      let peak = 0;
+      for (let i = 0; i < frame.length; i += 8) peak = Math.max(peak, Math.abs(frame[i]));
+      const target = gateOpen() ? Math.min(1, peak / 12000) : 0;
+      level = level * 0.6 + target * 0.4;
+      micBtn.style.setProperty("--level", level.toFixed(3));
+
+      // Always send a frame. Silence while the gate is shut keeps the STT's
+      // VAD ticking, so it closes the utterance right after you let go.
+      ws.send(gateOpen() ? e.data : new Int16Array(frame.length).buffer);
+    };
+    micCtx.createMediaStreamSource(stream).connect(node);
+    node.connect(micCtx.destination); // keeps the graph pulling; worklet emits no audio
+  }
+
+  async function openPlayback() {
+    // Deliberately NOT pinned to the server's rate: forcing an AudioContext
+    // onto a non-native rate degrades echo cancellation. Resample in JS.
+    playCtx = new AudioContext();
+    await playCtx.audioWorklet.addModule("/playback-worklet.js");
+    playback = new AudioWorkletNode(playCtx, "playback", { outputChannelCount: [1] });
+    playback.connect(playCtx.destination);
+    if ($("ambience").checked) stopAmbience = startAmbience(playCtx);
+  }
+
+  function playPcm(buffer) {
+    if (!playCtx) return;
+    const pcm = new Int16Array(buffer);
+    const floats = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) floats[i] = pcm[i] / 0x8000;
+    const out = resample(floats, serverRate, playCtx.sampleRate);
+    playback.port.postMessage(out.buffer, [out.buffer]);
+    thinking = false;
+    playEnd = Math.max(playEnd, playCtx.currentTime) + out.length / playCtx.sampleRate;
+    render();
+  }
+
+  function flushPlayback() {
+    playback?.port.postMessage("flush");
+    tail = 0;
+    playEnd = 0;
+  }
+
+  // Linear interpolation, carrying the last sample across chunk boundaries so
+  // the seams do not click. 24k -> 48k is an exact 2x, the common case.
+  function resample(input, from, to) {
+    if (from === to) return input;
+    const ratio = to / from;
+    const out = new Float32Array(Math.round(input.length * ratio));
+    for (let i = 0; i < out.length; i++) {
+      const src = i / ratio;
+      const i0 = Math.floor(src);
+      const a = i0 === 0 ? tail : input[i0 - 1] ?? tail;
+      const b = input[i0] ?? a;
+      out[i] = a + (b - a) * (src - i0);
+    }
+    tail = input[input.length - 1] ?? tail;
+    return out;
+  }
+
+  function appendReply(text) {
+    if (!currentReply) currentReply = line("agent", "");
+    currentReply.append(text + " ");
+    currentReply.scrollIntoView({ block: "end", behavior: "smooth" });
+  }
+
+  function hangup() {
+    const wasLive = live;
+    live = false; held = false; thinking = false; playEnd = 0; level = 0;
+    clearTimeout(graceTimer);
+    micBtn.style.setProperty("--level", "0");
+    stopAmbience?.(); stopAmbience = null;
+    if (ws && ws.readyState <= 1) ws.close();
+    stream?.getTracks().forEach((t) => t.stop());
+    for (const ctx of [micCtx, playCtx]) if (ctx && ctx.state !== "closed") ctx.close();
+    micCtx = playCtx = playback = stream = undefined;
+    sessionBtn.disabled = false;
+    sessionBtn.textContent = "Start session";
+    sessionBtn.classList.remove("end");
+    if (wasLive) setError("");
+    render();
+  }
+
+  render();
+</script>
+</html>

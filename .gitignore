@@ -1,0 +1,9 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.zoho_mcp_token.json
+rollback_*.json
+fixtures/agent_*.wav
+*.csv
+fixtures/exotel_*.wav
